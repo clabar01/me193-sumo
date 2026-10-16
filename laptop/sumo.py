@@ -9,11 +9,16 @@ The robot never moves unless the human is pushing the levers.
 Behavior tree (highest priority first):
     1. OUT         out button tapped: stop, sad song, publish out status
     2. TAPE GUARD  tape detected: lever drive, but forward is clamped to 0
-                   (reversing still allowed, so we can back off the edge)
+                   (reversing still allowed, so we can back off the edge).
+                   Latches: stays on until we've reversed for
+                   TAPE_RELEASE_REVERSE_SECONDS with the sensor off the tape.
     3. BOOST       opponent closer than 25 cm AND both levers pushed forward:
                    both motors full forward
     4. HUMAN       levers outside the deadzone: tank drive from the levers
     5. IDLE        levers at rest: motors stop
+
+Nothing in the main loop waits on the hardware: sensor readings arrive by
+callback, and motor and sound commands are sent with blocking=False.
 
 Run from the repo root:
     .venv/bin/python laptop/sumo.py             # real match
@@ -37,7 +42,10 @@ from bt import Selector, Sequence, Condition, Action, RUNNING
 from test_lego import connect, levers_to_tank
 
 # ---------------- Tunable constants ----------------
-LOOP_HZ = 20
+LOOP_HZ = 50                     # behavior tree ticks per second
+PRINT_HZ = 10                    # live line refresh (printing is slow-ish)
+SENSOR_NOTIFY_MS = 20            # color sensor + controller send readings every 20 ms
+                                 # (library minimum is 15)
 
 # Tape detection: blue hue AND enough saturation (a gray floor has a random
 # hue but low saturation). Get values from test_lego.py calibration (press 'c').
@@ -45,6 +53,10 @@ LOOP_HZ = 20
 TAPE_HUE_MIN = 185               # degrees
 TAPE_HUE_MAX = 235
 TAPE_MIN_SATURATION = 44         # None = not calibrated yet
+
+TAPE_RELEASE_REVERSE_SECONDS = 0.4  # reverse (both wheels, sensor off tape)
+                                    # this long to release the tape guard
+TAPE_BEEP_HZ = 880
 
 BOOST_DISTANCE_CM = 25
 BOOST_SPEED = 100                # percent
@@ -77,7 +89,7 @@ class Blackboard:
         self.is_out = False
 
 
-# ---------------- Actions with state ----------------
+# ---------------- Conditions and actions ----------------
 
 class GoOut(Action):
     """We lost: stop forever, play the sad song once, tell the world."""
@@ -90,7 +102,34 @@ class GoOut(Action):
         return RUNNING
 
 
-# ---------------- Conditions and actions ----------------
+class TapeGuard(Action):
+    """Follow the levers but never drive forward. Once tape is seen, stay
+    latched until the human has reversed long enough with the sensor off it."""
+
+    def __init__(self, name):
+        super().__init__(name)
+        self.latched = False
+        self.reverse_start = None    # when the current reverse began
+
+    def run(self, bb):
+        if not self.latched:
+            self.latched = True
+            bb.requests.append("tape_beep")
+
+        left, right = bb.levers
+        bb.drive = (min(left, 0), min(right, 0))
+
+        # Only count reversing once the sensor is back off the tape
+        reversing = bb.drive[0] < 0 and bb.drive[1] < 0 and not bb.tape
+        if not reversing:
+            self.reverse_start = None
+        elif self.reverse_start is None:
+            self.reverse_start = bb.now
+        elif bb.now - self.reverse_start >= TAPE_RELEASE_REVERSE_SECONDS:
+            self.latched = False
+            self.reverse_start = None
+        return RUNNING
+
 
 def opponent_close(bb):
     return bb.opponent_cm is not None and bb.opponent_cm < BOOST_DISTANCE_CM
@@ -98,13 +137,6 @@ def opponent_close(bb):
 
 def both_levers_forward(bb):
     return bb.levers[0] > 0 and bb.levers[1] > 0
-
-
-def guard_tape(bb):
-    """Follow the levers, but never drive forward: only stop or reverse."""
-    left, right = bb.levers
-    bb.drive = (min(left, 0), min(right, 0))
-    return RUNNING
 
 
 def boost(bb):
@@ -124,14 +156,15 @@ def idle(bb):
 
 def build_tree():
     # TAPE GUARD sits above BOOST, so boosting is also blocked on the tape.
+    guard = TapeGuard("TAPE GUARD (latched)")
     return Selector("root", [
         Sequence("out", [
             Condition("out button pressed?", lambda bb: bb.out_pressed or bb.is_out),
             GoOut("OUT: stopped, sad song"),
         ]),
         Sequence("tape guard", [
-            Condition("tape detected?", lambda bb: bb.tape),
-            Action("TAPE GUARD: no forward", guard_tape),
+            Condition("tape detected or latched?", lambda bb: bb.tape or guard.latched),
+            guard,
         ]),
         Sequence("boost", [
             Condition("opponent close?", opponent_close),
@@ -146,10 +179,68 @@ def build_tree():
     ])
 
 
-# ---------------- MQTT ----------------
+# ---------------- Sensors ----------------
+
+def is_tape(reading):
+    if TAPE_MIN_SATURATION is None:
+        return False
+    if math.isnan(reading.hue) or math.isnan(reading.saturation):
+        return False
+    return (TAPE_HUE_MIN <= reading.hue <= TAPE_HUE_MAX
+            and reading.saturation >= TAPE_MIN_SATURATION)
+
+
+class TapeWatcher:
+    """Checks every color reading the moment it arrives (library callback),
+    so a quick pass over the tape between two loop ticks is never missed.
+    Also counts readings so we can show the real update rate."""
+
+    def __init__(self, color_sensor):
+        self.tape_now = False
+        self.tape_seen = False       # sticky until the main loop reads it
+        self.count = 0               # all readings
+        self.new_count = 0           # readings whose values actually changed
+        self._last_values = None
+        if color_sensor is not None:
+            color_sensor.set_notification_callback(self._on_notification)
+
+    def _on_notification(self, data):
+        # Runs on the library's Bluetooth thread: keep it short, no device calls.
+        for item in le.device_notification_parser(data):
+            if isinstance(item, le.ColorSensorNotification):
+                self.count += 1
+                values = (item.rawRed, item.rawGreen, item.rawBlue, item.reflection)
+                if values != self._last_values:
+                    self.new_count += 1
+                    self._last_values = values
+                self.tape_now = is_tape(item)
+                if self.tape_now:
+                    self.tape_seen = True
+
+    def read(self):
+        """True if tape is under the sensor now or was seen since the last call."""
+        seen = self.tape_seen or self.tape_now
+        self.tape_seen = False
+        return seen
+
+
+class RateMeter:
+    """Turns an ever-increasing counter into updates per second."""
+
+    def __init__(self):
+        self.last_time = time.time()
+        self.last_count = 0
+        self.hz = 0.0
+
+    def update(self, count, now):
+        if now - self.last_time >= 1.0:
+            self.hz = (count - self.last_count) / (now - self.last_time)
+            self.last_time, self.last_count = now, count
+
 
 class DistanceListener:
-    """Keeps the latest distance from the Uno Q. Works fine with no messages."""
+    """Keeps the latest distance from the Uno Q. Works fine with no messages.
+    paho runs its network loop on its own thread, so nothing here blocks."""
 
     def __init__(self):
         self.dist_cm = None
@@ -187,23 +278,34 @@ class DistanceListener:
         self.client.disconnect()
 
 
+# ---------------- Sound ----------------
+
+class SongPlayer:
+    """Plays a list of (Hz, seconds) notes without blocking the main loop:
+    call update() every loop and it starts the next note when it's due."""
+
+    def __init__(self, motor):
+        self.motor = motor
+        self.notes = []
+        self.next_time = None        # None = not playing
+
+    def play(self, notes, now):
+        self.notes = list(notes)
+        self.next_time = now
+
+    def update(self, now):
+        if self.next_time is None or now < self.next_time:
+            return
+        if self.notes:
+            freq, seconds = self.notes.pop(0)
+            self.motor.beep(frequency=freq, blocking=False)
+            self.next_time = now + seconds
+        else:
+            self.motor.stop_beep(blocking=False)
+            self.next_time = None    # finished
+
+
 # ---------------- Main ----------------
-
-def read_tape(color_sensor):
-    if TAPE_MIN_SATURATION is None or color_sensor is None:
-        return False
-    s = color_sensor.sensor
-    if math.isnan(s.hue) or math.isnan(s.saturation):
-        return False
-    return TAPE_HUE_MIN <= s.hue <= TAPE_HUE_MAX and s.saturation >= TAPE_MIN_SATURATION
-
-
-def play_sad_song(motor):
-    for freq, seconds in SAD_SONG:
-        motor.beep(frequency=freq)
-        time.sleep(seconds)
-    motor.stop_beep()
-
 
 def main():
     parser = argparse.ArgumentParser(description="ME193 sumo robot")
@@ -220,32 +322,46 @@ def main():
         print("WARNING: TAPE_MIN_SATURATION not set, tape will never be detected.")
 
     # In dry-run we don't even connect the motor, so it physically can't move.
+    # The motor doesn't need to send us readings (notify 0 saves Bluetooth time).
     motor = None
     if not dry:
         motor = le.DoubleMotor()
-        if not connect(motor, "Double Motor"):
+        if not connect(motor, "Double Motor", notify_ms=0):
             sys.exit("Need the Double Motor.")
     color_sensor = le.ColorSensor()
-    if not connect(color_sensor, "Color Sensor"):
+    if not connect(color_sensor, "Color Sensor", notify_ms=SENSOR_NOTIFY_MS):
         color_sensor = None
     controller = le.Controller()
-    if not connect(controller, "Controller"):
+    if not connect(controller, "Controller", notify_ms=SENSOR_NOTIFY_MS):
         controller = None
     if not dry and (color_sensor is None or controller is None):
         sys.exit("Need the Color Sensor (tape) and Controller (out button) for a real run.")
 
+    tape_watcher = TapeWatcher(color_sensor)
     distance = DistanceListener()
+    song = SongPlayer(motor)
+
+    if color_sensor is not None:
+        start = tape_watcher.new_count
+        time.sleep(1.0)
+        print(f"\nColor sensor: {tape_watcher.new_count - start} new readings in 1 s "
+              f"(asked for {1000 / SENSOR_NOTIFY_MS:.0f} Hz)")
+
     tree = build_tree()
     bb = Blackboard()
     sent_drive = None
     last_node = None
+    loop_count = 0
+    loop_rate, color_rate = RateMeter(), RateMeter()
+    next_print = 0.0
+    next_tick = time.time()
 
     print("\nRunning" + (" in DRY RUN (motors disabled)" if dry else "") + ". Ctrl-C to stop.\n")
     try:
         while True:
-            # 1. Read inputs
+            # 1. Read inputs (all just reading variables, nothing waits)
             bb.now = time.time()
-            bb.tape = read_tape(color_sensor)
+            bb.tape = tape_watcher.read()
             bb.opponent_cm = distance.opponent_cm()
             if controller is not None and controller.connected:
                 bb.levers = levers_to_tank(controller)
@@ -261,9 +377,9 @@ def main():
             if bb.drive != sent_drive:
                 if motor:
                     if bb.drive == (0, 0):
-                        motor.movement_stop()
+                        motor.movement_stop(blocking=False)
                     else:
-                        motor.movement_move_tank(*bb.drive)
+                        motor.movement_move_tank(*bb.drive, blocking=False)
                 sent_drive = bb.drive
             for job in bb.requests:
                 if dry:
@@ -271,25 +387,42 @@ def main():
                 elif job == "publish_out":
                     distance.publish_out()
                 elif job == "sad_song":
-                    play_sad_song(motor)
+                    song.play(SAD_SONG, bb.now)
+                elif job == "tape_beep":
+                    motor.beep(frequency=TAPE_BEEP_HZ, blocking=False)
             bb.requests = []
+            if motor:
+                song.update(bb.now)
 
             # 4. Print: a permanent line when the node changes, plus a live line
+            loop_count += 1
+            loop_rate.update(loop_count, bb.now)
+            color_rate.update(tape_watcher.new_count, bb.now)
             if bb.active_node != last_node:
                 print(f"\n>>> {bb.active_node}")
                 last_node = bb.active_node
-            dist = f"{bb.opponent_cm:3d}cm" if bb.opponent_cm is not None else "  --"
-            print(f"\r{bb.active_node:28s} | motors L {bb.drive[0]:4d} R {bb.drive[1]:4d} "
-                  f"| tape {'YES' if bb.tape else 'no ':3s} | dist {dist} "
-                  f"| levers {bb.levers[0]:4d} {bb.levers[1]:4d}   ", end="", flush=True)
+            if bb.now >= next_print:
+                next_print = bb.now + 1 / PRINT_HZ
+                dist = f"{bb.opponent_cm:3d}cm" if bb.opponent_cm is not None else "  --"
+                print(f"\r{bb.active_node:24s} | motors L {bb.drive[0]:4d} R {bb.drive[1]:4d} "
+                      f"| tape {'YES' if bb.tape else 'no ':3s} | dist {dist} "
+                      f"| levers {bb.levers[0]:4d} {bb.levers[1]:4d} "
+                      f"| loop {loop_rate.hz:3.0f} Hz color {color_rate.hz:3.0f} Hz   ",
+                      end="", flush=True)
 
-            time.sleep(1 / LOOP_HZ)
+            # Sleep until the next tick, so the loop rate stays steady
+            next_tick += 1 / LOOP_HZ
+            delay = next_tick - time.time()
+            if delay > 0:
+                time.sleep(delay)
+            else:
+                next_tick = time.time()  # running late: don't try to catch up
     except KeyboardInterrupt:
         pass
     finally:
         print("\nStopping and disconnecting...")
         if motor and motor.connected:
-            motor.movement_stop()
+            motor.movement_stop()    # blocking here on purpose: make sure it stops
         distance.stop()
         for device in (motor, color_sensor, controller):
             if device and device.connected:

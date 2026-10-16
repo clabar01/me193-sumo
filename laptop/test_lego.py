@@ -110,11 +110,12 @@ def list_nearby_devices():
         print(f"  {product:13s} card {color_name(card_color):8s} serial {serial}  {mark}")
 
 
-def connect(device, label):
-    """Connect to the device of this type paired with OUR card only."""
+def connect(device, label, notify_ms=NOTIFY_MS):
+    """Connect to the device of this type paired with OUR card only.
+    notify_ms: how often the device sends readings (15-1000, or 0 for never)."""
     print(f"Connecting to {label} with card serial {CARD_SERIAL}...")
     try:
-        device.connect(card_serial=CARD_SERIAL, device_notification_delay=NOTIFY_MS)
+        device.connect(card_serial=CARD_SERIAL, device_notification_delay=notify_ms)
     except le.basic_device.VersionMismatchError as e:
         print(f"  {label}: {e}")
     if device.connected:
