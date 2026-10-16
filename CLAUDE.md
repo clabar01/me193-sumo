@@ -30,7 +30,7 @@ Robot sumo match in a blue tape ring. First robot pushed fully out loses and mus
 ## Behavior tree (priority order)
 The robot never moves unless the human is pushing the levers.
 1. OUT: controller button tapped: stop, sad song, publish out status
-2. TAPE GUARD: tape detected: block any forward motor command (clamp to 0 or below) but allow reversing, so the human can back away from the edge. Latches until the sensor no longer sees tape AND either lever has been pulled back at some point since the latch started (overshooting the tape without reversing keeps forward blocked)
+2. TAPE GUARD: tape detected: block any forward motor command (clamp to 0 or below) but allow reversing, so the human can back away from the edge. Latches until the sensor no longer sees tape AND either lever has been pulled back since the latch started. Pushing both levers forward while latched cancels that pull-back (a one-sided pivot doesn't), so overshooting the tape, with or without an earlier pull-back, keeps forward blocked
 3. BOOST: opponent closer than 25 cm AND both levers pushed forward: both motors full forward
 4. HUMAN: levers outside the deadzone: tank drive
 5. IDLE: levers at rest: motors stop

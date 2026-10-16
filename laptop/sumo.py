@@ -11,7 +11,8 @@ Behavior tree (highest priority first):
     2. TAPE GUARD  tape detected: lever drive, but forward is clamped to 0
                    (reversing still allowed, so we can back off the edge).
                    Latches: stays on until the sensor is off the tape AND
-                   we've pulled either lever back at some point since it latched.
+                   we've pulled either lever back since it latched (pushing both
+                   levers forward while latched cancels that pull-back).
     3. BOOST       opponent closer than 25 cm AND both levers pushed forward:
                    both motors full forward
     4. HUMAN       levers outside the deadzone: tank drive from the levers
@@ -104,8 +105,9 @@ class GoOut(Action):
 class TapeGuard(Action):
     """Follow the levers but never drive forward. Once tape is seen, stay
     latched until the sensor is off the tape AND the human has pulled either
-    lever back at some point since the latch started. If we overshoot the
-    tape without reversing, forward stays blocked."""
+    lever back since the latch started. Pushing BOTH levers forward while
+    latched cancels that pull-back, so it must be pulled back again. If we
+    overshoot the tape without reversing, forward stays blocked."""
 
     def __init__(self, name):
         super().__init__(name)
@@ -121,8 +123,10 @@ class TapeGuard(Action):
         left, right = bb.levers
         bb.drive = (min(left, 0), min(right, 0))
 
-        if left < 0 or right < 0:
-            self.has_reversed = True
+        if left > 0 and right > 0:
+            self.has_reversed = False   # trying to go forward: pull back again first
+        elif left < 0 or right < 0:
+            self.has_reversed = True    # either lever back (a pivot counts)
         if self.has_reversed and not bb.tape:
             self.latched = False
         return RUNNING
