@@ -31,8 +31,13 @@ Ctrl-C to quit (motors stop).
 import argparse
 import json
 import math
+import os
+import struct
+import subprocess
 import sys
+import tempfile
 import time
+import wave
 
 import legoeducation as le
 import paho.mqtt.client as mqtt
@@ -62,6 +67,9 @@ BOOST_DISTANCE_CM = 25
 BOOST_SPEED = 100                # percent
 
 SAD_SONG = [(523, 0.35), (494, 0.35), (466, 0.35), (440, 0.9)]  # (Hz, seconds)
+# The Double Motor's beeper is too quiet, so the song also plays on the laptop
+LAPTOP_SONG_VOLUME = 0.6         # 0..1
+LAPTOP_SONG_RATE = 44100         # samples per second
 
 MQTT_BROKER = "broker.hivemq.com"
 MQTT_PORT = 1883
@@ -306,13 +314,47 @@ class SongPlayer:
             self.next_time = None    # finished
 
 
+def make_song_wav(notes):
+    """Write the notes to a .wav file once at startup and return its path.
+    Each note is a sine with a few harmonics (a bit brassy) and a soft
+    start/end so the notes don't click; the last note wobbles (sad trombone)."""
+    path = os.path.join(tempfile.gettempdir(), "sumo_sad_song.wav")
+    rate, fade = LAPTOP_SONG_RATE, int(0.02 * LAPTOP_SONG_RATE)
+    frames = bytearray()
+    for i, (freq, seconds) in enumerate(notes):
+        n = int(seconds * rate)
+        last = i == len(notes) - 1
+        phase = 0.0
+        for k in range(n):
+            wobble = 1 + 0.015 * math.sin(2 * math.pi * 5 * k / rate) if last else 1
+            phase += 2 * math.pi * freq * wobble / rate
+            sample = (math.sin(phase) + 0.5 * math.sin(2 * phase) + 0.25 * math.sin(3 * phase)) / 1.75
+            envelope = min(1, k / fade, (n - k) / fade)
+            frames += struct.pack("<h", int(32767 * LAPTOP_SONG_VOLUME * envelope * sample))
+    with wave.open(path, "wb") as f:
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(rate)
+        f.writeframes(bytes(frames))
+    return path
+
+
+def play_on_laptop(path):
+    """Start playing a sound file and return immediately (afplay runs on its own)."""
+    try:
+        subprocess.Popen(["afplay", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (FileNotFoundError, OSError) as e:
+        print(f"\nCan't play sound on the laptop ({e})")
+
+
 # ---------------- Main ----------------
 
 def main():
     parser = argparse.ArgumentParser(description="ME193 sumo robot")
     parser.add_argument("--dry-run", action="store_true",
                         help="run the tree and print decisions, but never move the "
-                             "motors, beep or publish")
+                             "motors, beep the motor or publish (the laptop still "
+                             "plays the sad song)")
     args = parser.parse_args()
     dry = args.dry_run
 
@@ -341,6 +383,7 @@ def main():
     tape_watcher = TapeWatcher(color_sensor)
     distance = DistanceListener()
     song = SongPlayer(motor)
+    song_wav = make_song_wav(SAD_SONG)   # ahead of time, so OUT never waits on it
 
     if color_sensor is not None:
         start = tape_watcher.new_count
@@ -383,12 +426,14 @@ def main():
                         send_tank(motor, *bb.drive, blocking=False)
                 sent_drive = bb.drive
             for job in bb.requests:
+                if job == "sad_song":
+                    play_on_laptop(song_wav)   # also in dry-run: it's only the laptop
                 if dry:
                     print(f"\n[dry-run] would {job.replace('_', ' ')}")
                 elif job == "publish_out":
                     distance.publish_out()
                 elif job == "sad_song":
-                    song.play(SAD_SONG, bb.now)
+                    song.play(SAD_SONG, bb.now)   # motor beeps too, in case they're audible
                 elif job == "tape_beep":
                     motor.beep(frequency=TAPE_BEEP_HZ, blocking=False)
             bb.requests = []

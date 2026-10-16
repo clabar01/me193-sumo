@@ -92,7 +92,7 @@ levers.**
 
 | Priority | Node | Condition | Action |
 |---|---|---|---|
-| 1 | **OUT** | Controller button pressed (latches until the program is restarted) | Stop the motors, play the sad song on the Double Motor, publish `{"state": "out"}` |
+| 1 | **OUT** | Controller button pressed (latches until the program is restarted) | Stop the motors, play the sad song on the laptop speaker (and the Double Motor's beeper), publish `{"state": "out"}` |
 | 2 | **TAPE GUARD** | Tape detected, or the guard is still latched (see below) | Follow the levers, but each wheel is clamped to ≤ 0, so it can stop or reverse but not go forward |
 | 3 | **BOOST** | Opponent closer than 25 cm **and** both levers pushed forward | Both motors at 100 % forward |
 | 4 | **HUMAN** | Either lever outside the 5 % deadzone | Tank drive: left lever drives the left motor, right lever the right motor |
@@ -258,8 +258,11 @@ The app can also be opened and run from the Arduino App Lab desktop app.
 ```
 
 - A real run refuses to start without the motor, color sensor and controller.
-  `--dry-run` works with whatever devices are present, and prints the beeps and
-  MQTT publishes it would make instead of doing them.
+  `--dry-run` works with whatever devices are present, and prints the motor
+  beeps and MQTT publishes it would make instead of doing them. The sad song
+  still plays on the laptop speaker, so it can be tested.
+- The sad song is synthesized into a short `.wav` file at startup and played
+  with macOS's `afplay` in the background, so it never pauses the control loop.
 - At startup it prints the measured color sensor update rate.
 - **Live line:** active node, motor commands, tape, distance, levers, and
   actual loop and color-sensor rates. A new line is printed each time the
