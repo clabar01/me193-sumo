@@ -13,9 +13,10 @@ Robot sumo match in a blue tape ring. First robot pushed fully out loses and mus
 ## Hardware
 - LEGO Double Motor (drive), LEGO color sensor (blue tape detection), LEGO controller (teleop)
 - Controlled from laptop using the legoeducation Python library
+- LEGO Connection Card: orange diamond, serial 0999. Other students' devices show up in scans, so always connect with card_serial="0999" and never to the first device found
 - Uno Q board named AirFour, SSH user: arduino
 - Uno Q with HC-SR04: Trig on D2, Echo on D3 through a 1k/2k voltage divider
-- Not yet confirmed: whether legoeducation can read the LEGO controller. Fallback is keyboard teleop on the laptop.
+- legoeducation has a Controller class (controller.sensor.leftPercent / rightPercent / leftAngle / rightAngle), but not yet confirmed on our hardware. Fallback is WASD keyboard teleop on the laptop (see laptop/test_lego.py).
 
 ## Architecture
 - Uno Q: reads HC-SR04, publishes distance over MQTT
