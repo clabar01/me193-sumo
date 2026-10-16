@@ -10,8 +10,8 @@ Behavior tree (highest priority first):
     1. OUT         out button tapped: stop, sad song, publish out status
     2. TAPE GUARD  tape detected: lever drive, but forward is clamped to 0
                    (reversing still allowed, so we can back off the edge).
-                   Latches: stays on until we've reversed for
-                   TAPE_RELEASE_REVERSE_SECONDS with the sensor off the tape.
+                   Latches: stays on until the sensor is off the tape AND
+                   we've pulled either lever back at some point since it latched.
     3. BOOST       opponent closer than 25 cm AND both levers pushed forward:
                    both motors full forward
     4. HUMAN       levers outside the deadzone: tank drive from the levers
@@ -55,8 +55,6 @@ TAPE_HUE_MIN = 185               # degrees
 TAPE_HUE_MAX = 235
 TAPE_MIN_SATURATION = 44         # None = not calibrated yet
 
-TAPE_RELEASE_REVERSE_SECONDS = 0.4  # reverse (both wheels, sensor off tape)
-                                    # this long to release the tape guard
 TAPE_BEEP_HZ = 880
 
 BOOST_DISTANCE_CM = 25
@@ -105,30 +103,28 @@ class GoOut(Action):
 
 class TapeGuard(Action):
     """Follow the levers but never drive forward. Once tape is seen, stay
-    latched until the human has reversed long enough with the sensor off it."""
+    latched until the sensor is off the tape AND the human has pulled either
+    lever back at some point since the latch started. If we overshoot the
+    tape without reversing, forward stays blocked."""
 
     def __init__(self, name):
         super().__init__(name)
         self.latched = False
-        self.reverse_start = None    # when the current reverse began
+        self.has_reversed = False    # any reverse command since latching?
 
     def run(self, bb):
         if not self.latched:
             self.latched = True
+            self.has_reversed = False
             bb.requests.append("tape_beep")
 
         left, right = bb.levers
         bb.drive = (min(left, 0), min(right, 0))
 
-        # Only count reversing once the sensor is back off the tape
-        reversing = bb.drive[0] < 0 and bb.drive[1] < 0 and not bb.tape
-        if not reversing:
-            self.reverse_start = None
-        elif self.reverse_start is None:
-            self.reverse_start = bb.now
-        elif bb.now - self.reverse_start >= TAPE_RELEASE_REVERSE_SECONDS:
+        if left < 0 or right < 0:
+            self.has_reversed = True
+        if self.has_reversed and not bb.tape:
             self.latched = False
-            self.reverse_start = None
         return RUNNING
 
 
