@@ -25,7 +25,7 @@ Robot sumo match in a blue tape ring. First robot pushed fully out loses and mus
 ## MQTT
 - Broker: broker.hivemq.com, port 1883
 - ME193/ceci/sumo/dist: {"dist_cm": int, "t": timestamp}, -1 = no target
-- ME193/ceci/sumo/status: {"state": "out"}
+- ME193/ceci/sumo/status: {"state": "out"} shows "OUT" on the Uno Q LED matrix; any other state (e.g. {"state": "in"}) clears it
 
 ## Behavior tree (priority order)
 The robot never moves unless the human is pushing the levers.

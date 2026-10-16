@@ -1,0 +1,5 @@
+name: Sumo Distance
+icon: 🤼
+description: HC-SR04 distance to MQTT (ME193/ceci/sumo/dist) at 15 Hz; shows OUT on the LED matrix when the robot is out.
+ports: []
+bricks: []
