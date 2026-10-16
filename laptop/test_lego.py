@@ -13,8 +13,11 @@ Keys:
 
 Run from the repo root:
     .venv/bin/python laptop/test_lego.py
+    .venv/bin/python laptop/test_lego.py --levers   # lever debug: controller only,
+                                                    # prints raw percent and angle
 """
 
+import argparse
 import asyncio
 import math
 import select
@@ -44,8 +47,13 @@ KEY_HOLD_SECONDS = 0.5           # stop if no key repeat within this time
                                  # (must be longer than macOS key-repeat delay)
 
 LEVER_DEADZONE = 5               # percent; lever values smaller than this count as 0
-LEFT_LEVER_SIGN = 1              # set to -1 if pushing a lever forward drives backward
-RIGHT_LEVER_SIGN = 1
+# Sign convention: in ALL our logic, positive speed = physically forward.
+# On our robot, pushing a lever forward reads negative, and a negative motor
+# command drives physically forward, so all four signs are -1.
+LEFT_LEVER_SIGN = -1             # lever reading -> our speed
+RIGHT_LEVER_SIGN = -1
+LEFT_MOTOR_SIGN = -1             # our speed -> motor command (only in send_tank)
+RIGHT_MOTOR_SIGN = -1
 
 CALIBRATION_SAMPLES = 20         # samples per surface (2 s at 10 Hz)
 CALIBRATION_FIELDS = ["hue", "saturation", "reflection"]
@@ -232,6 +240,54 @@ def levers_to_tank(controller):
             lever_to_speed(c.rightPercent, RIGHT_LEVER_SIGN))
 
 
+def send_tank(motor, left, right, blocking=True):
+    """Drive with positive = physically forward. The only place motor signs are applied."""
+    motor.movement_move_tank(LEFT_MOTOR_SIGN * left, RIGHT_MOTOR_SIGN * right,
+                             blocking=blocking)
+
+
+def lever_debug():
+    """Print exactly what the Controller reports, so we can see which way is
+    positive for each lever. A new line is printed whenever a value changes."""
+    controller = le.Controller()
+    if not connect(controller, "Controller"):
+        sys.exit("Controller not found.")
+
+    fields = ["leftPercent", "rightPercent", "leftAngle", "rightAngle"]
+    low = {f: math.inf for f in fields}
+    high = {f: -math.inf for f in fields}
+    last = None
+
+    print("\nPush each lever fully forward, back to rest, then fully back. "
+          "Press q (or Ctrl-C) for a summary.\n")
+    print(f"{'time':>6s}  {'L %':>5s} {'R %':>5s}  {'L angle':>8s} {'R angle':>8s}"
+          f"   ->  speed L    R  (after deadzone + sign, + = forward)")
+    start = time.time()
+    try:
+        with Keyboard() as keyboard:
+            while keyboard.get_key() != "q":
+                c = controller.sensor
+                values = tuple(getattr(c, f) for f in fields)
+                if values != last and not any(math.isnan(v) for v in values):
+                    last = values
+                    for f, v in zip(fields, values):
+                        low[f], high[f] = min(low[f], v), max(high[f], v)
+                    left, right = levers_to_tank(controller)
+                    print(f"{time.time() - start:6.2f}  {c.leftPercent:5d} {c.rightPercent:5d}  "
+                          f"{c.leftAngle:8d} {c.rightAngle:8d}   ->  {left:9d} {right:4d}")
+                time.sleep(1 / LOOP_HZ)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        print("\nRange seen:")
+        for f in fields:
+            if high[f] >= low[f]:
+                print(f"  {f:13s} min {low[f]:6d}   max {high[f]:6d}")
+            else:
+                print(f"  {f:13s} (no readings)")
+        controller.disconnect()
+
+
 def main():
     list_nearby_devices()
     print()
@@ -273,7 +329,7 @@ def main():
                     break
                 elif key == "m" and motor_ok:
                     print("\nSpinning motors...")
-                    motor.movement_move_tank(MOTOR_TEST_SPEED, MOTOR_TEST_SPEED)
+                    send_tank(motor, MOTOR_TEST_SPEED, MOTOR_TEST_SPEED)
                     time.sleep(MOTOR_TEST_SECONDS)
                     motor.movement_stop()
                     last_drive = (0, 0)
@@ -304,7 +360,7 @@ def main():
                         drive = (0, 0)
                         print("\nController disconnected! Drive mode OFF, motors stopped.")
                     if drive != last_drive:
-                        motor.movement_move_tank(*drive)
+                        send_tank(motor, *drive)
                         last_drive = drive
 
                 # WASD fallback: drive while a key is held (key repeat)
@@ -317,7 +373,7 @@ def main():
                     else:
                         drive = last_drive
                     if drive != last_drive:
-                        motor.movement_move_tank(*drive)
+                        send_tank(motor, *drive)
                         last_drive = drive
 
                 # Live readings on one line
@@ -354,4 +410,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="LEGO hardware test")
+    parser.add_argument("--levers", action="store_true",
+                        help="lever debug: print raw Controller percent and angle")
+    if parser.parse_args().levers:
+        lever_debug()
+    else:
+        main()

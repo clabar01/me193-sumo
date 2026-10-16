@@ -38,8 +38,9 @@ import paho.mqtt.client as mqtt
 
 from bt import Selector, Sequence, Condition, Action, RUNNING
 # Reuse the hardware code we already tested: card-serial connect and the
-# lever -> tank-drive passthrough (deadzone and lever signs live there).
-from test_lego import connect, levers_to_tank
+# lever -> tank-drive passthrough. Lever and motor signs live there; in all
+# logic here, positive speed = physically forward.
+from test_lego import connect, levers_to_tank, send_tank
 
 # ---------------- Tunable constants ----------------
 LOOP_HZ = 50                     # behavior tree ticks per second
@@ -379,7 +380,7 @@ def main():
                     if bb.drive == (0, 0):
                         motor.movement_stop(blocking=False)
                     else:
-                        motor.movement_move_tank(*bb.drive, blocking=False)
+                        send_tank(motor, *bb.drive, blocking=False)
                 sent_drive = bb.drive
             for job in bb.requests:
                 if dry:
