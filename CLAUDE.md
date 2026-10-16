@@ -28,11 +28,12 @@ Robot sumo match in a blue tape ring. First robot pushed fully out loses and mus
 - ME193/ceci/sumo/status: {"state": "out"}
 
 ## Behavior tree (priority order)
-1. Out button pressed: stop, sad song, publish out status
-2. Tape detected: override human, reverse then turn
-3. Opponent < 25 cm: full power forward
-4. Controller input: follow human
-5. Else: slow spin search
+The robot never moves unless the human is pushing the levers.
+1. OUT: controller button tapped: stop, sad song, publish out status
+2. TAPE GUARD: tape detected: block any forward motor command (clamp to 0 or below) but allow reversing, so the human can back away from the edge
+3. BOOST: opponent closer than 25 cm AND both levers pushed forward: both motors full forward
+4. HUMAN: levers outside the deadzone: tank drive
+5. IDLE: levers at rest: motors stop
 
 ## Coding preferences
 - Keep code simple and readable, this is for a class

@@ -4,12 +4,16 @@ Sumo robot main control loop.
 Reads the LEGO Color Sensor, the LEGO Controller and the HC-SR04 distance
 (over MQTT from the Uno Q), runs the behavior tree, and drives the Double Motor.
 
+The robot never moves unless the human is pushing the levers.
+
 Behavior tree (highest priority first):
-    1. OUT       out button pressed: stop, sad song, publish out status
-    2. ESCAPE    tape detected: override human, reverse then turn ~120 degrees
-    3. ATTACK    opponent closer than 25 cm: full power forward
-    4. HUMAN     controller levers moved: tank drive from the levers
-    5. SEARCH    otherwise: slow spin
+    1. OUT         out button tapped: stop, sad song, publish out status
+    2. TAPE GUARD  tape detected: lever drive, but forward is clamped to 0
+                   (reversing still allowed, so we can back off the edge)
+    3. BOOST       opponent closer than 25 cm AND both levers pushed forward:
+                   both motors full forward
+    4. HUMAN       levers outside the deadzone: tank drive from the levers
+    5. IDLE        levers at rest: motors stop
 
 Run from the repo root:
     .venv/bin/python laptop/sumo.py             # real match
@@ -27,7 +31,7 @@ import time
 import legoeducation as le
 import paho.mqtt.client as mqtt
 
-from bt import Selector, Sequence, Condition, Action, SUCCESS, RUNNING
+from bt import Selector, Sequence, Condition, Action, RUNNING
 # Reuse the hardware code we already tested: card-serial connect and the
 # lever -> tank-drive passthrough (deadzone and lever signs live there).
 from test_lego import connect, levers_to_tank
@@ -42,20 +46,8 @@ TAPE_HUE_MIN = 185               # degrees
 TAPE_HUE_MAX = 235
 TAPE_MIN_SATURATION = 44         # None = not calibrated yet
 
-ESCAPE_REVERSE_SPEED = 60        # percent
-ESCAPE_REVERSE_SECONDS = 0.5
-ESCAPE_TURN_SPEED = 50           # percent
-ESCAPE_TURN_DEGREES = 120        # measured with the Double Motor's IMU yaw
-ESCAPE_TURN_MAX_SECONDS = 1.0    # stop turning after this even if IMU says less
-                                 # (also the whole turn if there's no IMU data)
-
-ATTACK_DISTANCE_CM = 25
-ATTACK_SPEED = 100
-
-HUMAN_HOLD_SECONDS = 1.5         # keep human control (motors stopped) this long
-                                 # after the levers are released, before SEARCH
-
-SEARCH_SPEED = 25                # spin in place
+BOOST_DISTANCE_CM = 25
+BOOST_SPEED = 100                # percent
 
 SAD_SONG = [(523, 0.35), (494, 0.35), (466, 0.35), (440, 0.9)]  # (Hz, seconds)
 
@@ -76,9 +68,7 @@ class Blackboard:
         self.out_pressed = False
         self.tape = False
         self.opponent_cm = None      # None = no opponent / no fresh data
-        self.levers = (0, 0)
-        self.last_lever_time = -math.inf  # when the levers were last moved
-        self.yaw = float("nan")
+        self.levers = (0, 0)         # after deadzone, (left, right) percent
         # outputs
         self.drive = (0, 0)          # (left, right) percent
         self.requests = []           # one-time jobs for the main loop
@@ -100,91 +90,59 @@ class GoOut(Action):
         return RUNNING
 
 
-class EscapeTape(Action):
-    """Reverse for a bit, then turn ~120 degrees, then hand control back."""
+# ---------------- Conditions and actions ----------------
 
-    def __init__(self, name):
-        super().__init__(name)
-        self.phase = None        # None, "reverse" or "turn"
-        self.phase_start = 0.0
-        self.start_yaw = float("nan")
-
-    @property
-    def active(self):
-        return self.phase is not None
-
-    def run(self, bb):
-        if self.phase is None:
-            self.phase, self.phase_start = "reverse", bb.now
-
-        if self.phase == "reverse":
-            bb.active_node = "ESCAPE: reversing"
-            bb.drive = (-ESCAPE_REVERSE_SPEED, -ESCAPE_REVERSE_SPEED)
-            if bb.now - self.phase_start >= ESCAPE_REVERSE_SECONDS:
-                self.phase, self.phase_start = "turn", bb.now
-                self.start_yaw = bb.yaw
-            return RUNNING
-
-        # phase == "turn"
-        bb.active_node = "ESCAPE: turning"
-        bb.drive = (ESCAPE_TURN_SPEED, -ESCAPE_TURN_SPEED)
-        turned = yaw_change(self.start_yaw, bb.yaw)
-        timed_out = bb.now - self.phase_start >= ESCAPE_TURN_MAX_SECONDS
-        if turned >= ESCAPE_TURN_DEGREES or timed_out:
-            self.phase = None
-            bb.drive = (0, 0)
-            return SUCCESS
-        return RUNNING
+def opponent_close(bb):
+    return bb.opponent_cm is not None and bb.opponent_cm < BOOST_DISTANCE_CM
 
 
-def yaw_change(start, current):
-    """Degrees turned since start, handling the jump at +/-180. 0 if no IMU data."""
-    if math.isnan(start) or math.isnan(current):
-        return 0
-    return abs((current - start + 180) % 360 - 180)
+def both_levers_forward(bb):
+    return bb.levers[0] > 0 and bb.levers[1] > 0
 
 
-def set_drive(speeds):
-    def action(bb):
-        bb.drive = speeds
-        return RUNNING
-    return action
+def guard_tape(bb):
+    """Follow the levers, but never drive forward: only stop or reverse."""
+    left, right = bb.levers
+    bb.drive = (min(left, 0), min(right, 0))
+    return RUNNING
 
 
-def human_in_control(bb):
-    """Levers moved now, or recently enough that it's just a brief pause."""
-    return bb.now - bb.last_lever_time < HUMAN_HOLD_SECONDS
+def boost(bb):
+    bb.drive = (BOOST_SPEED, BOOST_SPEED)
+    return RUNNING
 
 
 def follow_human(bb):
     bb.drive = bb.levers
-    if bb.levers == (0, 0):
-        bb.active_node = "HUMAN: paused"
+    return RUNNING
+
+
+def idle(bb):
+    bb.drive = (0, 0)
     return RUNNING
 
 
 def build_tree():
-    escape = EscapeTape("ESCAPE")
+    # TAPE GUARD sits above BOOST, so boosting is also blocked on the tape.
     return Selector("root", [
         Sequence("out", [
             Condition("out button pressed?", lambda bb: bb.out_pressed or bb.is_out),
             GoOut("OUT: stopped, sad song"),
         ]),
-        Sequence("tape", [
-            # keep escaping after we've backed off the tape
-            Condition("tape detected?", lambda bb: bb.tape or escape.active),
-            escape,
+        Sequence("tape guard", [
+            Condition("tape detected?", lambda bb: bb.tape),
+            Action("TAPE GUARD: no forward", guard_tape),
         ]),
-        Sequence("attack", [
-            Condition("opponent close?", lambda bb: bb.opponent_cm is not None
-                      and bb.opponent_cm < ATTACK_DISTANCE_CM),
-            Action("ATTACK: full forward", set_drive((ATTACK_SPEED, ATTACK_SPEED))),
+        Sequence("boost", [
+            Condition("opponent close?", opponent_close),
+            Condition("both levers forward?", both_levers_forward),
+            Action("BOOST: full forward", boost),
         ]),
         Sequence("human", [
-            Condition("controller input?", human_in_control),
+            Condition("levers moved?", lambda bb: bb.levers != (0, 0)),
             Action("HUMAN: tank drive", follow_human),
         ]),
-        Action("SEARCH: slow spin", set_drive((SEARCH_SPEED, -SEARCH_SPEED))),
+        Action("IDLE: stopped", idle),
     ])
 
 
@@ -291,13 +249,10 @@ def main():
             bb.opponent_cm = distance.opponent_cm()
             if controller is not None and controller.connected:
                 bb.levers = levers_to_tank(controller)
-                if bb.levers != (0, 0):
-                    bb.last_lever_time = bb.now
                 bb.out_pressed = controller.button.state == le.BUTTON_STATE_PRESSED
             else:
                 bb.levers = (0, 0)  # never follow stale lever values
                 bb.out_pressed = False
-            bb.yaw = motor.imu_device.yaw if motor else float("nan")
 
             # 2. Decide
             tree.tick(bb)
