@@ -48,8 +48,8 @@ LEFT_LEVER_SIGN = 1              # set to -1 if pushing a lever forward drives b
 RIGHT_LEVER_SIGN = 1
 
 CALIBRATION_SAMPLES = 20         # samples per surface (2 s at 10 Hz)
-CALIBRATION_FIELDS = ["reflection", "rawRed", "rawGreen", "rawBlue",
-                      "hue", "saturation", "value"]
+CALIBRATION_FIELDS = ["hue", "saturation", "reflection"]
+HUE_MARGIN = 15                  # degrees added around the tape's hue range
 
 # Values copied from legoeducation so the scan can decode advertisements
 LEGO_SERVICE_UUID = "0000FD02-0000-1000-8000-00805F9B34FB"
@@ -172,25 +172,37 @@ def calibrate(color_sensor, keyboard):
     keyboard.wait_for_key()
     tape = collect_samples(color_sensor)
 
-    print(f"\n{'field':12s} {'floor avg':>10s} {'tape avg':>10s}  separation")
-    best_field, best_score = None, -1
+    print(f"\n{'':12s} {'---- floor ----':>21s}   {'---- tape ----':>21s}")
+    print(f"{'field':12s} {'avg':>6s} {'min':>6s} {'max':>6s}   {'avg':>6s} {'min':>6s} {'max':>6s}")
     for field in CALIBRATION_FIELDS:
         f_vals = [s[field] for s in floor]
         t_vals = [s[field] for s in tape]
-        f_mean, t_mean = statistics.mean(f_vals), statistics.mean(t_vals)
-        spread = statistics.pstdev(f_vals) + statistics.pstdev(t_vals) + 1e-6
-        score = abs(t_mean - f_mean) / spread  # bigger = easier to tell apart
-        print(f"{field:12s} {f_mean:10.1f} {t_mean:10.1f}  {score:8.1f}")
-        if score > best_score:
-            best_field, best_score = field, score
+        print(f"{field:12s} {statistics.mean(f_vals):6.1f} {min(f_vals):6.0f} {max(f_vals):6.0f}"
+              f"   {statistics.mean(t_vals):6.1f} {min(t_vals):6.0f} {max(t_vals):6.0f}")
+    print("(floor hue is meaningless when its saturation is low -- that's why we "
+          "also need a minimum saturation)")
 
-    f_mean = statistics.mean(s[best_field] for s in floor)
-    t_mean = statistics.mean(s[best_field] for s in tape)
-    threshold = (f_mean + t_mean) / 2
-    direction = ">" if t_mean > f_mean else "<"
-    print(f"\nSuggested: tape detected when {best_field} {direction} {threshold:.1f}")
-    print("(uses the field with the best separation; hue wraps at 360, so "
-          "double-check hue if the floor is reddish)")
+    # Suggest: hue inside the tape's range (plus a margin) AND saturation above
+    # the halfway point between the floor's highest and the tape's lowest.
+    hue_min = max(0, min(s["hue"] for s in tape) - HUE_MARGIN)
+    hue_max = min(360, max(s["hue"] for s in tape) + HUE_MARGIN)
+    floor_sat_max = max(s["saturation"] for s in floor)
+    tape_sat_min = min(s["saturation"] for s in tape)
+    sat_min = (floor_sat_max + tape_sat_min) / 2
+
+    print("\nSuggested values for the top of sumo.py:")
+    print(f"    TAPE_HUE_MIN = {hue_min:.0f}")
+    print(f"    TAPE_HUE_MAX = {hue_max:.0f}")
+    print(f"    TAPE_MIN_SATURATION = {sat_min:.0f}")
+    if tape_sat_min <= floor_sat_max:
+        print("  WARNING: floor and tape saturation overlap, so saturation alone "
+              "can't separate them. Check the hue ranges carefully.")
+
+    def is_tape(s):
+        return hue_min <= s["hue"] <= hue_max and s["saturation"] >= sat_min
+    print(f"Check: {sum(map(is_tape, floor))}/{len(floor)} floor samples and "
+          f"{sum(map(is_tape, tape))}/{len(tape)} tape samples count as tape "
+          f"(want 0 and all).")
     print("Press any key to go back to live readings.\n")
     keyboard.wait_for_key()
 
